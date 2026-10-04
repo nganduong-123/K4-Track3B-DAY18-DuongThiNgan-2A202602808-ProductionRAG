@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Module 3: Reranking — Cross-encoder top-20 → top-3 + latency benchmark."""
 
-import os, sys, time
+import os, re, sys, time
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
@@ -29,28 +29,51 @@ class CrossEncoderReranker:
 
     def _load_model(self):
         if self._model is None:
-            # TODO: Load cross-encoder model
-            # from sentence_transformers import CrossEncoder
-            # self._model = CrossEncoder(self.model_name)
-            #
-            # ⚠️ LƯU Ý: Dùng sentence_transformers.CrossEncoder, KHÔNG dùng FlagEmbedding.
-            # FlagReranker crash với transformers>=5.0 (XLMRobertaTokenizer lỗi).
-            pass
+            lightweight = os.getenv("RAG_LIGHTWEIGHT", "").lower() in {"1", "true", "yes"}
+            if not lightweight:
+                try:
+                    from sentence_transformers import CrossEncoder
+                    self._model = CrossEncoder(self.model_name)
+                except Exception as error:
+                    print(f"  ⚠️  Cross-encoder unavailable, using lexical fallback: {error}")
+            if self._model is None:
+                class LexicalReranker:
+                    @staticmethod
+                    def predict(pairs):
+                        scores = []
+                        for query, document in pairs:
+                            query_tokens = set(re.findall(r"\w+", query.lower(), flags=re.UNICODE))
+                            document_tokens = set(re.findall(r"\w+", document.lower(), flags=re.UNICODE))
+                            overlap = len(query_tokens & document_tokens)
+                            scores.append(overlap / max(len(query_tokens), 1))
+                        return scores
+                self._model = LexicalReranker()
         return self._model
 
     def rerank(self, query: str, documents: list[dict], top_k: int = RERANK_TOP_K) -> list[RerankResult]:
         """Rerank documents: top-20 → top-k."""
-        # TODO: Implement reranking
-        # 1. if not documents: return []
-        # 2. model = self._load_model()
-        # 3. pairs = [(query, doc["text"]) for doc in documents]
-        # 4. scores = model.predict(pairs)
-        # 5. if isinstance(scores, (int, float)): scores = [scores]
-        # 6. scored = sorted(zip(scores, documents), key=lambda x: x[0], reverse=True)
-        # 7. Return [RerankResult(text=..., original_score=doc.get("score", 0.0),
-        #            rerank_score=float(score), metadata=..., rank=i)
-        #            for i, (score, doc) in enumerate(scored[:top_k])]
-        return []
+        if not documents or top_k <= 0:
+            return []
+        model = self._load_model()
+        pairs = [(query, document["text"]) for document in documents]
+        scores = model.predict(pairs)
+        if isinstance(scores, (int, float)):
+            scores = [scores]
+        scored = sorted(
+            zip(scores, documents),
+            key=lambda item: float(item[0]),
+            reverse=True,
+        )
+        return [
+            RerankResult(
+                text=document["text"],
+                original_score=float(document.get("score", 0.0)),
+                rerank_score=float(score),
+                metadata=dict(document.get("metadata", {})),
+                rank=rank,
+            )
+            for rank, (score, document) in enumerate(scored[:top_k])
+        ]
 
 
 class FlashrankReranker:
@@ -59,10 +82,34 @@ class FlashrankReranker:
         self._model = None
 
     def rerank(self, query: str, documents: list[dict], top_k: int = RERANK_TOP_K) -> list[RerankResult]:
-        # TODO (optional): from flashrank import Ranker, RerankRequest
-        # model = Ranker(); passages = [{"text": d["text"]} for d in documents]
-        # results = model.rerank(RerankRequest(query=query, passages=passages))
-        return []
+        if not documents or top_k <= 0:
+            return []
+        from flashrank import Ranker, RerankRequest
+
+        if self._model is None:
+            self._model = Ranker()
+        passages = [
+            {
+                "id": str(index),
+                "text": document["text"],
+                "meta": document.get("metadata", {}),
+            }
+            for index, document in enumerate(documents)
+        ]
+        results = self._model.rerank(RerankRequest(query=query, passages=passages))
+        reranked = []
+        for rank, result in enumerate(results[:top_k]):
+            original = documents[int(result["id"])]
+            reranked.append(
+                RerankResult(
+                    text=result["text"],
+                    original_score=float(original.get("score", 0.0)),
+                    rerank_score=float(result["score"]),
+                    metadata=dict(original.get("metadata", {})),
+                    rank=rank,
+                )
+            )
+        return reranked
 
 
 def benchmark_reranker(reranker, query: str, documents: list[dict], n_runs: int = 5) -> dict:

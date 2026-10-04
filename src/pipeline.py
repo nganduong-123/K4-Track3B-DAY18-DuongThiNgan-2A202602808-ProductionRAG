@@ -15,7 +15,7 @@ from src.m2_search import HybridSearch
 from src.m3_rerank import CrossEncoderReranker
 from src.m4_eval import load_test_set, evaluate_ragas, failure_analysis, save_report
 from src.m5_enrichment import enrich_chunks
-from config import RERANK_TOP_K
+from config import OPENAI_BASE_URL, OPENAI_MODEL, RERANK_TOP_K
 
 
 def build_pipeline():
@@ -29,10 +29,23 @@ def build_pipeline():
     print("\n[1/4] Chunking documents...", flush=True)
     docs = load_documents()
     all_chunks = []
+    parent_lookup = {}
     for doc in docs:
         parents, children = chunk_hierarchical(doc["text"], metadata=doc["metadata"])
+        source = doc["metadata"].get("source", "document")
+        for parent in parents:
+            unique_parent_id = f"{source}:{parent.parent_id}"
+            parent_lookup[unique_parent_id] = parent.text
         for child in children:
-            all_chunks.append({"text": child.text, "metadata": {**child.metadata, "parent_id": child.parent_id}})
+            unique_parent_id = f"{source}:{child.parent_id}"
+            all_chunks.append({
+                "text": child.text,
+                "metadata": {
+                    **child.metadata,
+                    "parent_id": unique_parent_id,
+                    "parent_text": parent_lookup[unique_parent_id],
+                },
+            })
     print(f"  ✓ {len(all_chunks)} chunks from {len(docs)} documents ({time.time()-t0:.1f}s)", flush=True)
 
     # Step 2: Enrichment (M5)
@@ -66,15 +79,20 @@ def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) 
     results = search.search(query)
     docs = [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in results]
     reranked = reranker.rerank(query, docs, top_k=RERANK_TOP_K)
-    contexts = [r.text for r in reranked] if reranked else [r.text for r in results[:3]]
+    selected = reranked if reranked else results[:3]
+    contexts = [item.metadata.get("parent_text", item.text) for item in selected]
+    contexts = list(dict.fromkeys(contexts))
 
     from config import OPENAI_API_KEY
     if OPENAI_API_KEY and contexts:
         try:
             from openai import OpenAI
-            client = OpenAI()
+            client_kwargs = {}
+            if OPENAI_BASE_URL:
+                client_kwargs["base_url"] = OPENAI_BASE_URL
+            client = OpenAI(**client_kwargs)
             context_str = "\n\n".join(contexts)
-            resp = client.chat.completions.create(model="gpt-4o-mini", messages=[
+            resp = client.chat.completions.create(model=OPENAI_MODEL, messages=[
                 {"role": "system", "content": "Trả lời CHỈ dựa trên context. Nếu không có → nói 'Không tìm thấy.'"},
                 {"role": "user", "content": f"Context:\n{context_str}\n\nCâu hỏi: {query}"},
             ])
